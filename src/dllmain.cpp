@@ -3,7 +3,7 @@
 // Не зависит от версии игры и маппингов.
 //
 // Клавиши (окно игры должно быть активно):
-//   INSERT  - показать/скрыть HUD
+//   RIGHT SHIFT - показать/скрыть HUD
 //   NUMPAD1..3 - переключить демо-модули (пока просто флаги для списка)
 //   END     - выгрузить DLL
 
@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,17 @@ static std::atomic<bool> g_unload{false};
 static std::atomic<bool> g_cleaned{false};
 static bool              g_init     = false;
 static bool              g_showHud  = true;
+static DWORD             g_startTick = 0;
+
+// Лог в %TEMP%\mchud.log — чтобы можно было проверить, что DLL загрузилась
+static void Log(const char* msg)
+{
+    char path[MAX_PATH];
+    if (!GetTempPathA(MAX_PATH, path)) return;
+    strcat_s(path, "mchud.log");
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "a") == 0 && f) { fprintf(f, "%s\n", msg); fclose(f); }
+}
 
 struct Module { const char* name; int key; bool enabled; bool prev; };
 static std::vector<Module> g_modules = {
@@ -46,10 +58,10 @@ static bool KeyPressed(int vk, bool& prev)
 
 static void HandleInput(HWND wnd)
 {
-    static bool pIns = false, pEnd = false;
+    static bool pShift = false, pEnd = false;
     if (GetForegroundWindow() != wnd) return;
 
-    if (KeyPressed(VK_INSERT, pIns)) g_showHud = !g_showHud;
+    if (KeyPressed(VK_RSHIFT, pShift)) g_showHud = !g_showHud;
     if (KeyPressed(VK_END, pEnd))    g_unload = true;
     for (auto& m : g_modules)
         if (KeyPressed(m.key, m.prev)) m.enabled = !m.enabled;
@@ -78,6 +90,11 @@ static void DrawHud(float w)
     DrawTextShadow(dl, ImVec2(pad, pad), IM_COL32(120, 200, 255, 255), "MyClient 1.21.11");
     snprintf(buf, sizeof buf, "FPS: %d", fps);
     DrawTextShadow(dl, ImVec2(pad, pad + 16.f), IM_COL32(255, 255, 255, 255), buf);
+
+    // Первые 8 секунд после инжекта: подтверждение, что DLL работает
+    if (GetTickCount() - g_startTick < 8000)
+        DrawTextShadow(dl, ImVec2(pad, pad + 32.f), IM_COL32(255, 220, 80, 255),
+                       "Injected OK | RShift - hide/show HUD | END - unload");
 
     // Правый верхний угол: список включённых модулей (по длине, как ArrayList)
     std::vector<const char*> on;
@@ -157,7 +174,9 @@ static BOOL WINAPI hkSwapBuffers(HDC hdc)
 
 static DWORD WINAPI MainThread(LPVOID)
 {
-    if (MH_Initialize() != MH_OK) { FreeLibraryAndExitThread(g_module, 1); }
+    g_startTick = GetTickCount();
+    Log("mchud: DLL loaded, installing hook");
+    if (MH_Initialize() != MH_OK) { Log("mchud: MH_Initialize failed"); FreeLibraryAndExitThread(g_module, 1); }
 
     HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
     if (!gdi) gdi = LoadLibraryW(L"gdi32.dll");
@@ -166,9 +185,11 @@ static DWORD WINAPI MainThread(LPVOID)
     if (!g_target ||
         MH_CreateHook(g_target, (LPVOID)&hkSwapBuffers, (LPVOID*)&g_origSwap) != MH_OK ||
         MH_EnableHook(g_target) != MH_OK) {
+        Log("mchud: hook FAILED");
         MH_Uninitialize();
         FreeLibraryAndExitThread(g_module, 1);
     }
+    Log("mchud: hook installed OK");
 
     while (!g_unload) Sleep(50);
 
