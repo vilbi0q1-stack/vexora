@@ -24,9 +24,41 @@
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 
-// Временная диагностика: окно "DLL загружена" при инжекте.
-// Когда убедишься, что всё работает, поставь 0 и пересобери.
-#define MCHUD_LOAD_POPUP 1
+// Отладочная консоль: окно cmd, которое открывает сама DLL (никаких файлов на диске).
+// Когда убедишься, что всё работает, поставь 0 и пересобери — тогда консоли не будет вообще.
+#define MCHUD_CONSOLE 1
+
+#if MCHUD_CONSOLE
+#include <cstdarg>
+static void Log(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+    fflush(stdout);
+}
+static void OpenConsole()
+{
+    if (!AllocConsole()) return;
+    FILE* f = nullptr;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    SetConsoleTitleA("mchud debug (do not close this window - use END in game)");
+    // Крестик убираем: закрытие консоли убило бы весь процесс игры
+    HWND c = GetConsoleWindow();
+    if (c) {
+        HMENU m = GetSystemMenu(c, FALSE);
+        if (m) DeleteMenu(m, SC_CLOSE, MF_BYCOMMAND);
+    }
+}
+static void CloseConsole() { FreeConsole(); }
+#else
+#define Log(...) ((void)0)
+static void OpenConsole() {}
+static void CloseConsole() {}
+#endif
 
 #ifndef GL_FRAMEBUFFER
 #define GL_FRAMEBUFFER          0x8D40
@@ -49,22 +81,6 @@ static bool              g_init     = false;
 static bool              g_showHud  = true;
 static DWORD             g_startTick = 0;
 static glBindFramebuffer_t g_glBindFramebuffer = nullptr;
-
-// Сообщение в отдельном потоке, чтобы не блокировать рендер/инициализацию
-static DWORD WINAPI PopupThread(LPVOID p)
-{
-    char* msg = (char*)p;
-    MessageBoxA(nullptr, msg, "mchud", MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
-    free(msg);
-    return 0;
-}
-static void Popup(const char* msg)
-{
-    char* copy = _strdup(msg);
-    if (!copy) return;
-    HANDLE t = CreateThread(nullptr, 0, PopupThread, copy, 0, nullptr);
-    if (t) CloseHandle(t); else free(copy);
-}
 
 struct Module { const char* name; int key; bool enabled; bool prev; };
 static std::vector<Module> g_modules = {
@@ -147,14 +163,24 @@ static void Cleanup()
 
 static void RenderHud(HDC hdc)
 {
-    if (!wglGetCurrentContext()) return;
+    if (!wglGetCurrentContext()) {
+        static bool noCtx = false;
+        if (!noCtx) { noCtx = true; Log("[render] no current GL context in this thread, skipping"); }
+        return;
+    }
 
     HWND wnd = WindowFromDC(hdc);
     if (!wnd) wnd = GetForegroundWindow();
-    if (!wnd) return;
+    if (!wnd) {
+        static bool noWnd = false;
+        if (!noWnd) { noWnd = true; Log("[render] no window for DC, skipping"); }
+        return;
+    }
 
-    static bool initFailedShown = false;
     if (!g_init) {
+        static bool initFailed = false;
+        Log("[render] GL_VERSION  = %s", (const char*)glGetString(GL_VERSION));
+        Log("[render] GL_RENDERER = %s", (const char*)glGetString(GL_RENDERER));
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
@@ -162,10 +188,11 @@ static void RenderHud(HDC hdc)
         // Minecraft использует core profile >= 3.2
         if (!ImGui_ImplOpenGL3_Init("#version 150")) {
             ImGui::DestroyContext();
-            if (!initFailedShown) { initFailedShown = true; Popup("mchud: ImGui OpenGL init failed"); }
+            if (!initFailed) { initFailed = true; Log("[render] ImGui_ImplOpenGL3_Init FAILED"); }
             return;
         }
         g_glBindFramebuffer = (glBindFramebuffer_t)wglGetProcAddress("glBindFramebuffer");
+        Log("[render] ImGui init OK, glBindFramebuffer = %p", (void*)g_glBindFramebuffer);
         g_init = true;
     }
 
@@ -175,6 +202,15 @@ static void RenderHud(HDC hdc)
     GetClientRect(wnd, &rc);
     float w = (float)(rc.right - rc.left), h = (float)(rc.bottom - rc.top);
     if (w < 1.f || h < 1.f) return;
+
+    static int frameCount = 0;
+    static DWORD lastReport = 0;
+    frameCount++;
+    if (frameCount == 1) Log("[render] first frame drawn, window %dx%d", (int)w, (int)h);
+    if (GetTickCount() - lastReport > 5000) {
+        lastReport = GetTickCount();
+        Log("[render] alive, frames drawn: %d", frameCount);
+    }
 
     static auto last = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
@@ -204,12 +240,16 @@ static void RenderHud(HDC hdc)
     if (g_glBindFramebuffer) g_glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
 }
 
-static BOOL CommonSwap(HDC hdc, SwapBuffers_t orig)
+static BOOL CommonSwap(HDC hdc, SwapBuffers_t orig, const char* tag)
 {
     // Флаг держим на время вызова оригинала: wglSwapBuffers может внутри вызвать
     // gdi32!SwapBuffers, и тогда HUD нарисовался бы дважды за кадр.
     static thread_local bool inSwap = false;
     if (inSwap) return orig(hdc);
+
+    static bool seenGdi = false, seenWgl = false;
+    bool& seen = (tag[0] == 'g') ? seenGdi : seenWgl;
+    if (!seen) { seen = true; Log("[hook] %s called by the game (thread %lu)", tag, GetCurrentThreadId()); }
 
     inSwap = true;
     if (g_unload) {
@@ -222,19 +262,22 @@ static BOOL CommonSwap(HDC hdc, SwapBuffers_t orig)
     return r;
 }
 
-static BOOL WINAPI hkGdiSwap(HDC hdc) { return CommonSwap(hdc, g_origGdi); }
-static BOOL WINAPI hkWglSwap(HDC hdc) { return CommonSwap(hdc, g_origWgl); }
+static BOOL WINAPI hkGdiSwap(HDC hdc) { return CommonSwap(hdc, g_origGdi, "gdi32!SwapBuffers"); }
+static BOOL WINAPI hkWglSwap(HDC hdc) { return CommonSwap(hdc, g_origWgl, "wglSwapBuffers"); }
 
 static bool HookFunction(const wchar_t* dll, const char* name, LPVOID detour,
                          LPVOID* outTarget, LPVOID* outOrig)
 {
     HMODULE m = GetModuleHandleW(dll);
     if (!m) m = LoadLibraryW(dll);
-    if (!m) return false;
+    if (!m) { Log("[init] %s: module not found", name); return false; }
     LPVOID target = (LPVOID)GetProcAddress(m, name);
-    if (!target) return false;
-    if (MH_CreateHook(target, detour, outOrig) != MH_OK) return false;
-    if (MH_EnableHook(target) != MH_OK) { MH_RemoveHook(target); return false; }
+    if (!target) { Log("[init] %s: GetProcAddress failed", name); return false; }
+    MH_STATUS s = MH_CreateHook(target, detour, outOrig);
+    if (s != MH_OK) { Log("[init] %s: MH_CreateHook failed: %s", name, MH_StatusToString(s)); return false; }
+    s = MH_EnableHook(target);
+    if (s != MH_OK) { Log("[init] %s: MH_EnableHook failed: %s", name, MH_StatusToString(s)); MH_RemoveHook(target); return false; }
+    Log("[init] %s hooked at %p", name, target);
     *outTarget = target;
     return true;
 }
@@ -242,9 +285,14 @@ static bool HookFunction(const wchar_t* dll, const char* name, LPVOID detour,
 static DWORD WINAPI MainThread(LPVOID)
 {
     g_startTick = GetTickCount();
+    OpenConsole();
+    Log("[init] mchud loaded into pid %lu", GetCurrentProcessId());
 
-    if (MH_Initialize() != MH_OK) {
-        Popup("mchud: MH_Initialize failed");
+    MH_STATUS ms = MH_Initialize();
+    if (ms != MH_OK) {
+        Log("[init] MH_Initialize failed: %s", MH_StatusToString(ms));
+        Sleep(15000);               // дать время прочитать сообщение
+        CloseConsole();
         FreeLibraryAndExitThread(g_module, 1);
     }
 
@@ -254,18 +302,18 @@ static DWORD WINAPI MainThread(LPVOID)
                               &g_targetWgl, (LPVOID*)&g_origWgl);
 
     if (!okGdi && !okWgl) {
-        Popup("mchud: hook FAILED (SwapBuffers not hooked)");
+        Log("[init] no hook installed, unloading in 15 s");
+        Sleep(15000);               // дать время прочитать сообщение
         MH_Uninitialize();
+        CloseConsole();
         FreeLibraryAndExitThread(g_module, 1);
     }
 
-#if MCHUD_LOAD_POPUP
-    Popup(okGdi && okWgl ? "mchud: DLL loaded, hooks: gdi32 OK, opengl32 OK"
-        : okGdi          ? "mchud: DLL loaded, hooks: gdi32 OK, opengl32 FAILED"
-                         : "mchud: DLL loaded, hooks: gdi32 FAILED, opengl32 OK");
-#endif
+    Log("[init] ready. Waiting for the game to swap buffers... (END in game = unload)");
 
     while (!g_unload) Sleep(50);
+
+    Log("[unload] END pressed, cleaning up");
 
     // ждём, пока рендер-поток сам освободит ImGui (до 2 сек)
     for (int i = 0; i < 40 && !g_cleaned; ++i) Sleep(50);
@@ -273,6 +321,9 @@ static DWORD WINAPI MainThread(LPVOID)
     MH_DisableHook(MH_ALL_HOOKS);
     Sleep(200);                 // дать выйти потокам, которые ещё внутри хука
     MH_Uninitialize();
+    Log("[unload] done");
+    Sleep(500);
+    CloseConsole();
     FreeLibraryAndExitThread(g_module, 0);
 }
 
